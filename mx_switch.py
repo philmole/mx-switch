@@ -12,6 +12,7 @@ because hidapi opens devices exclusively on macOS and would freeze the mouse.
 """
 import argparse
 import collections
+import queue
 import signal
 import sys
 import threading
@@ -256,7 +257,8 @@ class MacHandle(object):
             mac.CFRelease(dev)
             hint = ""
             if ret == MacBackend.kIOReturnNotPermitted:
-                hint = " - grant Input Monitoring to Terminal/python3 in System Settings > Privacy & Security"
+                hint = (" - grant Input Monitoring to Terminal/python3 in System Settings > Privacy & Security,"
+                        " or run with --ble")
             raise IOError("IOHIDDeviceOpen failed 0x%08x%s" % (ret, hint))
         self.reports = collections.deque()
         self.buf = mac.ct.create_string_buffer(64)
@@ -284,6 +286,229 @@ class MacHandle(object):
             self.mac.DeviceClose(self.dev, 0)
             self.mac.CFRelease(self.dev)
             self.dev = None
+
+
+GATT_LOGI_SUFFIX = "011F2000046D"  # Logitech's vendor GATT service/characteristic UUIDs end with this
+GATT_PINNED = "==10.3.1"  # last pyobjc with wheels for macOS's built-in Python 3.9
+
+
+def _gatt_delegate_class():
+    """Defined lazily so pyobjc is only imported when --ble is used."""
+    import objc
+    from Foundation import NSObject
+
+    class MxSwitchGattDelegate(NSObject):
+        """CoreBluetooth callbacks, forwarded to the GattHandle of each peripheral."""
+
+        @objc.python_method
+        def _h(self, p):
+            return self.owner.handles.get(p.identifier().UUIDString())
+
+        def centralManagerDidUpdateState_(self, central):
+            if central.state() >= 2:  # past Unknown/Resetting
+                self.owner.state_known.set()
+
+        def centralManager_didConnectPeripheral_(self, central, p):
+            p.discoverServices_(None)
+
+        def centralManager_didFailToConnectPeripheral_error_(self, central, p, err):
+            h = self._h(p)
+            if h:
+                h.fail("connect failed: %s" % err)
+
+        def centralManager_didDisconnectPeripheral_error_(self, central, p, err):
+            h = self._h(p)
+            if h:
+                h.fail("disconnected")
+
+        def peripheral_didDiscoverServices_(self, p, err):
+            h = self._h(p)
+            if h:
+                h.on_services(err)
+
+        def peripheral_didDiscoverCharacteristicsForService_error_(self, p, service, err):
+            h = self._h(p)
+            if h:
+                h.on_characteristics(service, err)
+
+        def peripheral_didUpdateNotificationStateForCharacteristic_error_(self, p, c, err):
+            h = self._h(p)
+            if h:
+                h.on_notify_state(err)
+
+        def peripheral_didUpdateValueForCharacteristic_error_(self, p, c, err):
+            h = self._h(p)
+            if h and not err and c.value() is not None:
+                h.on_value(bytes(c.value()))
+
+    return MxSwitchGattDelegate
+
+
+class GattBackend(object):
+    """macOS without Input Monitoring: HID++ over Logitech's vendor GATT service
+    through CoreBluetooth, which only needs the Bluetooth permission."""
+
+    def __init__(self):
+        try:
+            import CoreBluetooth
+            import Foundation
+            import libdispatch
+        except ImportError:
+            sys.exit("Missing dependency: python3 -m pip install --user "
+                     "pyobjc-framework-CoreBluetooth%s pyobjc-framework-libdispatch%s" % (GATT_PINNED, GATT_PINNED))
+        self.CB = CoreBluetooth
+        self.NSData = Foundation.NSData
+        self.handles = {}  # peripheral UUID -> GattHandle
+        self.state_known = threading.Event()
+        self.delegate = _gatt_delegate_class().alloc().init()
+        self.delegate.owner = self
+        dq = libdispatch.dispatch_queue_create(b"mx-switch.ble", None)  # callbacks run off the main thread
+        self.central = CoreBluetooth.CBCentralManager.alloc().initWithDelegate_queue_(self.delegate, dq)
+        self.state_known.wait(5)
+        if self.central.state() != CoreBluetooth.CBManagerStatePoweredOn:
+            sys.exit("Bluetooth unavailable (state %d) - is it on, and allowed for Terminal/python3 under "
+                     "System Settings > Privacy & Security > Bluetooth?" % self.central.state())
+
+    def _connected(self):
+        uuids = [self.CB.CBUUID.UUIDWithString_(u) for u in ("1812", "180A", "180F")]
+        return self.central.retrieveConnectedPeripheralsWithServices_(uuids) or []
+
+    def enumerate(self, vid):
+        return [
+            {
+                "path": p.identifier().UUIDString(),
+                "product_id": 0,
+                "product_string": p.name() or "",
+                "usage_page": HIDPP_USAGE_PAGE,  # checked for real when it's opened
+            }
+            for p in self._connected()
+        ]
+
+    def open_path(self, path):
+        for p in self._connected():
+            if p.identifier().UUIDString() == path:
+                return GattHandle(self, p)
+        raise IOError("device not found")
+
+
+class GattHandle(object):
+    """Takes and returns the same 20-byte HID++ reports as the HID handles. The
+    characteristic may carry them without the report ID and device index; which
+    framing the device uses is detected on open."""
+
+    def __init__(self, backend, peripheral):
+        self.b = backend
+        self.p = peripheral
+        self.key = peripheral.identifier().UUIDString()
+        self.rx = self.tx = None
+        self.error = None
+        self.setup_done = threading.Event()
+        self.reports = queue.Queue()
+        self.closed = False
+        self.full = False  # True if the characteristic carries complete 20-byte reports
+        self.last_write = 0.0
+        backend.handles[self.key] = self
+        peripheral.setDelegate_(backend.delegate)
+        backend.central.connectPeripheral_options_(peripheral, None)
+        if not self.setup_done.wait(5) or self.error or self.rx is None or self.tx is None:
+            err = self.error or "timed out"
+            self.close()
+            raise IOError("GATT setup failed: %s" % err)
+        self._detect_framing()
+
+    # -- CoreBluetooth callbacks (dispatch queue thread) --------------------
+
+    def fail(self, msg):
+        self.error = self.error or msg
+        self.setup_done.set()
+        self.reports.put(None)
+
+    def on_services(self, err):
+        services = [s for s in (self.p.services() or [])
+                    if s.UUID().UUIDString().upper().endswith(GATT_LOGI_SUFFIX)]
+        if err or not services:
+            self.fail("no Logitech vendor service (%s)" % err)
+            return
+        self.p.discoverCharacteristics_forService_(None, services[0])
+
+    def on_characteristics(self, service, err):
+        if err:
+            self.fail("characteristic discovery failed: %s" % err)
+            return
+        chars = service.characteristics() or []
+        # Prefer one characteristic that does both; otherwise split notify / write.
+        both = [c for c in chars if c.properties() & 0x10 and c.properties() & 0x0C]
+        self.rx = both[0] if both else next((c for c in chars if c.properties() & 0x10), None)
+        self.tx = both[0] if both else next((c for c in chars if c.properties() & 0x0C), None)
+        dlog("%s GATT chars %s" % (self.p.name(), ", ".join(
+            "%s/%02x" % (c.UUID().UUIDString(), c.properties()) for c in chars)))
+        if self.rx is None or self.tx is None:
+            self.fail("no usable HID++ characteristic")
+            return
+        self.p.setNotifyValue_forCharacteristic_(True, self.rx)
+
+    def on_notify_state(self, err):
+        if err:
+            self.fail("enabling notifications failed: %s" % err)
+        else:
+            self.setup_done.set()
+
+    def on_value(self, data):
+        if not (len(data) >= REPORT_LEN and data[0] in (0x10, 0x11) and data[1] == DEVICE_INDEX):
+            data = bytes([REPORT_LONG, DEVICE_INDEX]) + data
+        self.reports.put(data)
+
+    # -- handle interface (device thread) -----------------------------------
+
+    def _detect_framing(self):
+        ping = [REPORT_LONG, DEVICE_INDEX, 0x00, 0x10 | SW_ID, 0, 0, 0x5A]  # Root.getProtocolVersion
+        ping += [0] * (REPORT_LEN - len(ping))
+        for full in (False, True):
+            self.full = full
+            self.write(ping)
+            deadline = time.time() + REQUEST_TIMEOUT
+            while time.time() < deadline:
+                data = self.read(64, 100)
+                if len(data) >= 7 and data[2] == 0x00 and data[3] == 0x10 | SW_ID and data[6] == 0x5A:
+                    dlog("%s GATT framing: %s" % (self.p.name(), "20-byte" if full else "18-byte"))
+                    return
+        self.close()
+        raise IOError("no HID++ reply over GATT")
+
+    def read(self, max_length, timeout_ms):
+        if self.closed:
+            raise IOError("closed")
+        try:
+            data = self.reports.get(timeout=timeout_ms / 1000.0)
+        except queue.Empty:
+            return []
+        if data is None:
+            raise IOError(self.error or "disconnected")
+        return list(data[:max_length])
+
+    def write(self, data):
+        if self.closed or self.error:
+            return -1
+        buf = bytes(bytearray(data))
+        if not self.full:
+            buf = buf[2:]
+        with_response = self.tx.properties() & 0x08
+        self.p.writeValue_forCharacteristic_type_(
+            self.b.NSData.dataWithBytes_length_(buf, len(buf)), self.tx,
+            self.b.CB.CBCharacteristicWriteWithResponse if with_response
+            else self.b.CB.CBCharacteristicWriteWithoutResponse)
+        self.last_write = time.time()
+        return len(buf)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if time.time() - self.last_write < 0.3:
+            time.sleep(0.3)  # writes are async; let e.g. the button release go out first
+        self.b.handles.pop(self.key, None)
+        self.b.central.cancelPeripheralConnection_(self.p)  # drops our link only, not the system's
+        self.reports.put(None)
 
 
 backend = None
@@ -676,10 +901,15 @@ def main():
                    help="only use devices whose name contains this (default: MX); repeatable")
     p.add_argument("--probe", action="store_true", help="list devices, features and button CIDs, then exit")
     p.add_argument("--debug", action="store_true", help="log all HID++ traffic")
+    p.add_argument("--ble", action="store_true",
+                   help="macOS: talk over Bluetooth GATT (needs the Bluetooth permission, not Input Monitoring)")
     args = p.parse_args()
 
     debug = args.debug
-    backend = MacBackend() if sys.platform == "darwin" else HidapiBackend()
+    if sys.platform == "darwin":
+        backend = GattBackend() if args.ble else MacBackend()
+    else:
+        backend = HidapiBackend()
     match = [m.lower() for m in (args.match or ["MX"])]
 
     if args.probe:

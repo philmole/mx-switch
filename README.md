@@ -54,6 +54,18 @@ No pip install is needed: on macOS the script uses the built-in IOKit through ct
 
    To stop it: `launchctl unload ~/Library/LaunchAgents/com.user.mxswitch.plist`
 
+### If you can't grant Input Monitoring
+
+Use `--ble`, which talks to the devices over Logitech's own Bluetooth (GATT) service instead. That only needs the **Bluetooth** permission. One-time install:
+
+```sh
+python3 -m pip install --user --upgrade pip
+python3 -m pip install --user "pyobjc-core==10.3.1" "pyobjc-framework-Cocoa==10.3.1" \
+  "pyobjc-framework-CoreBluetooth==10.3.1" "pyobjc-framework-libdispatch==10.3.1"
+```
+
+Then use `--ble` on every command, e.g. `python3 ~/mx-switch/mx_switch.py --ble --target 1`. To auto-start it, add `<string>--ble</string>` to the plist's `ProgramArguments`.
+
 ### Keeping the Mac awake
 
 The script doesn't touch power settings. If you want the switch back to be instant instead of waiting a few seconds for the Mac to wake:
