@@ -80,6 +80,7 @@ class Probe(NSObject):
         if self.pending[key] <= 0:
             self._finish(p)
 
+    @objc.python_method
     def _finish(self, p):
         self.pending.pop(p.identifier().UUIDString(), None)
         if not self.pending:
