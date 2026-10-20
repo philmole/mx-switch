@@ -52,9 +52,6 @@ No pip install is needed: on macOS the script uses the built-in IOKit through ct
    Under launchd it's `python3` rather than Terminal that needs the permission. If the log shows the permission error, add or enable `python3` in that same list. Use the `+` button and press Cmd+Shift+G to reach the path printed by `which python3` if it isn't listed.
 
    To remove it: `sh ~/mx-switch/install-mac.sh --uninstall`
-
-   Or, to run it in a visible Terminal window instead: add `start-mac.command` under **System Settings → General → Login Items** (or just double-click it). It runs `--ble --target 1`, so edit it if you need something else. Closing the window stops the script.
-
 ### If you can't grant Input Monitoring
 
 Use `--ble`, which talks to the devices over Logitech's own Bluetooth (GATT) service instead. That only needs the **Bluetooth** permission. One-time install:
