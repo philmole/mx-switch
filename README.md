@@ -35,7 +35,7 @@ $s.Save()
 
 No pip install is needed: on macOS the script uses the built-in IOKit through ctypes.
 
-1. Copy `mx_switch.py` to `~/mx-switch/` on the Mac.
+1. Copy the repo to `~/mx-switch/` on the Mac.
 2. Check Python with `python3 --version`. If it asks to install the Command Line Tools, accept.
 3. First run, from Terminal:
    ```sh
@@ -45,14 +45,13 @@ No pip install is needed: on macOS the script uses the built-in IOKit through ct
 4. Test it with `python3 ~/mx-switch/mx_switch.py --target 1`, then press the button.
 5. Auto-start at login:
    ```sh
-   # edit YOURNAME in the plist first
-   cp com.user.mxswitch.plist ~/Library/LaunchAgents/
-   launchctl load ~/Library/LaunchAgents/com.user.mxswitch.plist
-   tail -f /tmp/mx-switch.log
+   sh ~/mx-switch/install-mac.sh --target 1
    ```
-   Under launchd it's `python3` rather than Terminal that needs Input Monitoring. If the log shows the permission error, add or enable `python3` in that same list. Use the `+` button and press Cmd+Shift+G to reach `/usr/bin/python3` if it isn't listed.
+   This installs a LaunchAgent that starts the script at every login (and restarts it if it dies), then shows the log. Any arguments are passed to `mx_switch.py`; with none it uses `--ble --target 1`.
 
-   To stop it: `launchctl unload ~/Library/LaunchAgents/com.user.mxswitch.plist`
+   Under launchd it's `python3` rather than Terminal that needs the permission. If the log shows the permission error, add or enable `python3` in that same list. Use the `+` button and press Cmd+Shift+G to reach the path printed by `which python3` if it isn't listed.
+
+   To remove it: `sh ~/mx-switch/install-mac.sh --uninstall`
 
 ### If you can't grant Input Monitoring
 
@@ -64,7 +63,7 @@ python3 -m pip install --user "pyobjc-core==10.3.1" "pyobjc-framework-Cocoa==10.
   "pyobjc-framework-CoreBluetooth==10.3.1" "pyobjc-framework-libdispatch==10.3.1"
 ```
 
-Then use `--ble` on every command, e.g. `python3 ~/mx-switch/mx_switch.py --ble --target 1`. To auto-start it, add `<string>--ble</string>` to the plist's `ProgramArguments`.
+Then use `--ble` on every command, e.g. `python3 ~/mx-switch/mx_switch.py --ble --target 1`. To auto-start it: `sh ~/mx-switch/install-mac.sh` (its default is `--ble --target 1`).
 
 ### Keeping the Mac awake
 
